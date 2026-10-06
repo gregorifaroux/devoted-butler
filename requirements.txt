@@ -2,3 +2,5 @@ tokenizers>=0.21
 smolagents[litellm]
 gradio
 requests
+ddgs
+markdownify
