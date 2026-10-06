@@ -1,19 +1,25 @@
 # devoted-butler
 
-A multi-agent party planner behind a Gradio chat UI. A `CodeAgent` manager ("Devoted Butler") fans out to three `ToolCallingAgent` workers in parallel: `song_agent` (iTunes-backed), `food_agent` (hardcoded menus), and `trend_agent` (agentic RAG over DuckDuckGo), then combines their output into one plan.
+A multi-agent party planner behind a Gradio chat UI. A `CodeAgent` manager ("Devoted Butler") picks which of three `ToolCallingAgent` workers the brief actually needs: `song_agent` (iTunes-backed), `food_agent` (hardcoded menus), and `trend_agent` (agentic RAG over DuckDuckGo), then concatenates their output into one Markdown plan.
 
 ![Devoted Butler UI](images/butler_screenshot.png)
 
 ## Topology
 
-- **Manager** — `CodeAgent` with one tool: `plan_party_in_parallel`. The tool runs all three workers on a `ThreadPoolExecutor(max_workers=3)` and returns the combined Markdown plan. The manager calls the tool once, then `final_answer` with its return value.
+- **Manager** — `CodeAgent`, no tools of its own. Reads each worker's `name` + `description` and picks which workers the brief calls for. One worker per code block, sequentially. Final step concatenates each worker's output under a `## <name>` header via `final_answer`.
 - **song_agent** — `ToolCallingAgent` with `find_songs` only. Picks 5 artists that fit the theme, calls `find_songs` once with all names, returns the lines iTunes returned.
 - **food_agent** — `ToolCallingAgent` with `suggest_food_menu` only. Calls the tool once and forwards its text as the final answer.
 - **trend_agent** — `ToolCallingAgent` with `DuckDuckGoSearchTool`. Agentic RAG: searches live web results for ideas tailored to the theme, then synthesizes a Markdown block with `### Food ideas`, `### Music & vibe`, and `### Setting & decor` sections.
 
 Each worker's `managed_agent` task template is overridden to constrain its reply shape (single tool-call per step, final answer must be a plain Markdown string). The `report` template is also overridden to `{{final_answer}}` so the worker's output isn't prefixed by "Here is the final answer from your managed agent 'X':".
 
-Parallelism is enforced in Python (`plan_party_in_parallel`) rather than left to the model to generate a `ThreadPoolExecutor` block, because a 14B local model isn't reliable at writing concurrent orchestration code.
+## Language guard
+
+`qwen2.5:14b` occasionally slips into Thai or Chinese mid-generation. Three safeguards:
+
+1. `temperature=0.0` on `LiteLLMModel` for deterministic sampling.
+2. An `ENGLISH_RULE` string ("You MUST write ALL text in English only.") prepended to each worker's `instructions` field — lands in the system prompt.
+3. An `ENGLISH_TAIL` string appended to each worker's `managed_agent.task` template — the last thing the model sees before generating.
 
 ## UI
 
@@ -23,10 +29,11 @@ Parallelism is enforced in Python (`plan_party_in_parallel`) rather than left to
 - Wrap `gr.ChatInterface` in `gr.Blocks(theme="soft", css=...)` for a cleaner look and force the avatar to fill the circle (`object-fit: cover`).
 - Set the chatbot label and interface title to `"Devoted Butler"`.
 - Point `avatar_images` at the local `images/butler.png`.
+- Expose three one-click example prompts under the input: "Suggest party themes", "Songs for a punk rock party", "Menu for a formal dinner with co-workers".
 
 smolagents requires an agent `name` to be a valid Python identifier, so the manager is `name="devoted_butler"` with the display name in `description`.
 
-`ButlerGradioUI` also overrides `_stream_response` to show a live "Working..." heartbeat with elapsed seconds and one line per worker (`song_agent: running...`, `food_agent: step 1 done`, `trend_agent: done`) while the manager's code block is running. See [docs/streaming.md](docs/streaming.md) for how the thread + queue + step_callbacks interleave works.
+`ButlerGradioUI` also overrides `_stream_response` to show a live "Working..." heartbeat with elapsed seconds and one line per worker (`song_agent: idle`, `food_agent: step 1 done`, `trend_agent: step 2 done`) while the manager's code block is running. See [docs/streaming.md](docs/streaming.md) for how the thread + queue + step_callbacks interleave works.
 
 ## Prerequisites
 
@@ -52,7 +59,7 @@ uv pip install -r requirements.txt
 ./devoted_butler.sh
 ```
 
-The script activates `.venv`, starts Ollama if it isn't running, then launches the UI. Gradio prints a local URL. Open it, type a party brief (for example "Plan a villain masquerade party at Wayne's mansion"), and the manager coordinates the three workers in parallel.
+The script activates `.venv`, starts Ollama if it isn't running, then launches the UI. Gradio prints a local URL. Open it, click one of the example prompts or type a party brief (for example "Plan a villain masquerade party at Wayne's mansion"), and the manager decides which workers to invoke.
 
 ## Files
 

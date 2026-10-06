@@ -10,7 +10,6 @@ from smolagents import (
     GradioUI,
     LiteLLMModel,
     DuckDuckGoSearchTool,
-    VisitWebpageTool,
     tool,
 )
 from smolagents.memory import ActionStep, PlanningStep, FinalAnswerStep
@@ -42,7 +41,6 @@ class ButlerGradioUI(GradioUI):
         return list(getattr(self.agent, "managed_agents", {}).values())
 
     def _stream_response(self, message, history):  # noqa: ARG002
-        global PROGRESS_SINK
         task, task_files = self._process_message(message)
 
         q: queue.Queue = queue.Queue()
@@ -60,8 +58,6 @@ class ButlerGradioUI(GradioUI):
             cb = make_progress_cb(sub.name)
             sub.step_callbacks.register(ActionStep, cb)
             registered.append((sub, cb))
-
-        PROGRESS_SINK = lambda name, info: q.put(("progress", name, info))
 
         def run_agent():
             try:
@@ -84,7 +80,7 @@ class ButlerGradioUI(GradioUI):
         accumulated_events: list = []
         streaming_msg_idx = None
         heartbeat_idx = None
-        worker_status = {name: "waiting" for name in worker_names}
+        worker_status = {name: "idle" for name in worker_names}
         start = time.time()
         skip_model_outputs = getattr(self.agent, "stream_outputs", False)
 
@@ -170,7 +166,6 @@ class ButlerGradioUI(GradioUI):
                         all_messages[streaming_msg_idx] = msg
                     yield all_messages
         finally:
-            PROGRESS_SINK = None
             for sub, cb in registered:
                 try:
                     sub.step_callbacks._callbacks.get(ActionStep, []).remove(cb)
@@ -200,6 +195,11 @@ class ButlerGradioUI(GradioUI):
             padding: 0 !important;
         }
         """
+        examples = [
+            "Suggest party themes",
+            "Songs for a punk rock party",
+            "Menu for a formal dinner with co-workers",
+        ]
         with gr.Blocks(theme="soft", css=css) as demo:
             gr.ChatInterface(
                 fn=self._stream_response,
@@ -207,6 +207,8 @@ class ButlerGradioUI(GradioUI):
                 title="Devoted Butler",
                 multimodal=self.file_upload_folder is not None,
                 save_history=True,
+                examples=examples,
+                cache_examples=False,
                 **type_messages_kwarg,
             )
         return demo
@@ -216,7 +218,7 @@ model = LiteLLMModel(
     model_id="ollama_chat/qwen2.5:14b",
     api_base="http://127.0.0.1:11434",
     num_ctx=16384,
-    temperature=0.2,
+    temperature=0.0,
 )
 
 
@@ -251,6 +253,8 @@ def find_songs(artists: str) -> str:
     return "\n".join(lines)
 
 
+ENGLISH_RULE = "You MUST write ALL text in English only. No other languages. "
+
 song_agent = ToolCallingAgent(
     name="song_agent",
     description="Finds songs and artists for a party. Give it a party theme and a venue.",
@@ -259,7 +263,8 @@ song_agent = ToolCallingAgent(
     max_steps=8,
     stream_outputs=True,
     instructions=(
-        "Name 5 artists whose music fits the theme, then call find_songs once per artist, "
+        ENGLISH_RULE
+        + "Name 5 artists whose music fits the theme, then call find_songs once per artist, "
         "for example find_songs('Billie Eilish'). Keep only songs whose artist is the one you searched. "
         "If a search returns nothing, change the keyword. "
         "Never list a song that find_songs did not return."
@@ -274,7 +279,8 @@ food_agent = ToolCallingAgent(
     max_steps=3,
     stream_outputs=True,
     instructions=(
-        "Only suggest food and drinks. Call the tool and print the result, "
+        ENGLISH_RULE
+        + "Only suggest food and drinks. Call the tool and print the result, "
         "then give the final answer in a later step with ONE string."
     ),
 )
@@ -291,7 +297,8 @@ trend_agent = ToolCallingAgent(
     max_steps=4,
     stream_outputs=True,
     instructions=(
-        "RULES:\n"
+        ENGLISH_RULE
+        + "RULES:\n"
         "- Make EXACTLY ONE tool call per reply. Never batch multiple tool calls.\n"
         "- Never invent tool call ids like 'broad_search' or 'synthesize'.\n\n"
         "STEP 1: call web_search once. Query = '<theme> party ideas food music decor'.\n"
@@ -304,32 +311,32 @@ trend_agent = ToolCallingAgent(
     ),
 )
 
-ENGLISH_ONLY = "Respond ONLY in English. All reasoning, tool arguments, and the final answer must be in English.\n\n"
+ENGLISH_TAIL = "\n\nIMPORTANT: Reply in English ONLY. No other languages anywhere in your reasoning or output."
 
 SONG_TASK = (
-    ENGLISH_ONLY
-    + "You are '{{name}}'. Your manager gave you this task:\n{{task}}\n\n"
+    "You are '{{name}}'. Your manager gave you this task:\n{{task}}\n\n"
     "Pick 5 artists whose music fits the task. Then call find_songs ONCE with all five names "
     "in one string, for example find_songs('Madonna, Iron Maiden, Ozzy Osbourne, Queen, Ice-T'). "
     "Your last step must be a call to the tool final_answer, with the lines find_songs returned "
     "as its answer argument. Do not write the songs as plain text. "
     "Every reply must be a tool call."
+    + ENGLISH_TAIL
 )
 FOOD_TASK = (
-    ENGLISH_ONLY
-    + "You are '{{name}}'. Your manager gave you this task:\n{{task}}\n\n"
+    "You are '{{name}}'. Your manager gave you this task:\n{{task}}\n\n"
     "Call suggest_food_menu once. Then call final_answer with ONE string containing "
     "exactly the text the tool returned. Add nothing."
+    + ENGLISH_TAIL
 )
 TREND_TASK = (
-    ENGLISH_ONLY
-    + "You are '{{name}}'. Your manager gave you this task:\n{{task}}\n\n"
+    "You are '{{name}}'. Your manager gave you this task:\n{{task}}\n\n"
     "Reply 1: ONE tool call to web_search with '<theme> party ideas food music decor'.\n"
     "Reply 2: ONE tool call to final_answer. The answer argument must be a single Markdown "
     "STRING (not a dict, not JSON) with exactly these three ### headers:\n"
     "### Food ideas\n### Music & vibe\n### Setting & decor\n"
     "Each section has 2-4 '- ' bullets drawn from the search snippets. No URLs. No preamble. "
     "Every reply is exactly one tool call. Never batch tool calls."
+    + ENGLISH_TAIL
 )
 song_agent.prompt_templates["managed_agent"]["task"] = SONG_TASK
 food_agent.prompt_templates["managed_agent"]["task"] = FOOD_TASK
@@ -338,62 +345,26 @@ trend_agent.prompt_templates["managed_agent"]["task"] = TREND_TASK
 for a in (song_agent, food_agent, trend_agent):
     a.prompt_templates["managed_agent"]["report"] = "{{final_answer}}"
 
-PROGRESS_SINK = None
-
-
-def _ping(agent_name, info):
-    sink = PROGRESS_SINK
-    if sink is not None:
-        sink(agent_name, info)
-
-
-@tool
-def plan_party_in_parallel(brief: str) -> str:
-    """Runs all three worker agents (song, food, trend) IN PARALLEL on the party brief
-    and returns a single Markdown plan combining their outputs.
-    Call this exactly once per party request; it is the only tool you need.
-    Args:
-        brief: The user's party brief, including the theme and any venue. Pass it verbatim.
-    """
-    from concurrent.futures import ThreadPoolExecutor
-
-    def run(agent, name):
-        _ping(name, "running...")
-        try:
-            result = agent(brief)
-            _ping(name, "done")
-            return result
-        except Exception as e:
-            _ping(name, f"error: {e!r}")
-            raise
-
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        s = ex.submit(run, song_agent, "song_agent")
-        f = ex.submit(run, food_agent, "food_agent")
-        t = ex.submit(run, trend_agent, "trend_agent")
-        song_result, food_result, trend_result = s.result(), f.result(), t.result()
-    return (
-        f"## Songs\n{song_result}\n\n"
-        f"## Menu\n{food_result}\n\n"
-        f"{trend_result}"
-    )
-
-
 manager = CodeAgent(
     name="devoted_butler",
     description="Devoted Butler. Help plan your party... music, food, you name it.",
-    tools=[plan_party_in_parallel],
+    tools=[],
     model=model,
     managed_agents=[song_agent, food_agent, trend_agent],
-    max_steps=3,
+    max_steps=6,
     stream_outputs=True,
     executor_kwargs={"timeout_seconds": 300},
     instructions=(
-        "Step 1: ONE code block that calls plan_party_in_parallel exactly once with the user's "
-        "brief verbatim, stores the result, and prints it:\n"
-        "plan = plan_party_in_parallel(brief='<the full user brief>')\n"
-        "print(plan)\n"
-        "Step 2: call final_answer(plan). Do not edit, reformat, or add anything to plan."
+        "You coordinate three workers. Read each worker's description and decide which ones the "
+        "user's brief actually needs:\n"
+        "- song_agent: pick when the user wants music/songs/a playlist.\n"
+        "- food_agent: pick when the user wants food/drinks/a menu.\n"
+        "- trend_agent: pick when the user wants themed ideas, decor, settings, or current trends.\n\n"
+        "Call only the workers the brief calls for. One worker per code block. Pass the user's "
+        "brief verbatim as the task. After each worker returns, print its result. When all "
+        "needed workers are done, call final_answer with a single Markdown string that "
+        "concatenates each worker's output under a '## <name>' header, in the order you called "
+        "them. Do not reformat or edit the worker text."
     ),
 )
 
