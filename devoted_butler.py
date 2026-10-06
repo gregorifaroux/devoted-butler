@@ -304,8 +304,11 @@ trend_agent = ToolCallingAgent(
     ),
 )
 
+ENGLISH_ONLY = "Respond ONLY in English. All reasoning, tool arguments, and the final answer must be in English.\n\n"
+
 SONG_TASK = (
-    "You are '{{name}}'. Your manager gave you this task:\n{{task}}\n\n"
+    ENGLISH_ONLY
+    + "You are '{{name}}'. Your manager gave you this task:\n{{task}}\n\n"
     "Pick 5 artists whose music fits the task. Then call find_songs ONCE with all five names "
     "in one string, for example find_songs('Madonna, Iron Maiden, Ozzy Osbourne, Queen, Ice-T'). "
     "Your last step must be a call to the tool final_answer, with the lines find_songs returned "
@@ -313,12 +316,14 @@ SONG_TASK = (
     "Every reply must be a tool call."
 )
 FOOD_TASK = (
-    "You are '{{name}}'. Your manager gave you this task:\n{{task}}\n\n"
+    ENGLISH_ONLY
+    + "You are '{{name}}'. Your manager gave you this task:\n{{task}}\n\n"
     "Call suggest_food_menu once. Then call final_answer with ONE string containing "
     "exactly the text the tool returned. Add nothing."
 )
 TREND_TASK = (
-    "You are '{{name}}'. Your manager gave you this task:\n{{task}}\n\n"
+    ENGLISH_ONLY
+    + "You are '{{name}}'. Your manager gave you this task:\n{{task}}\n\n"
     "Reply 1: ONE tool call to web_search with '<theme> party ideas food music decor'.\n"
     "Reply 2: ONE tool call to final_answer. The answer argument must be a single Markdown "
     "STRING (not a dict, not JSON) with exactly these three ### headers:\n"
