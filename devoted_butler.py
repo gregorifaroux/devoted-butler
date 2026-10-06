@@ -1,8 +1,14 @@
 """Devoted Butler: a multi-agent party planner behind a Gradio chat UI.
 
-A CodeAgent manager delegates to a song_agent (iTunes-backed) and a food_agent
-(hardcoded menus). ButlerGradioUI subclasses smolagents.GradioUI to add a
-placeholder, a soft theme, a local avatar, and a title.
+Flow:
+  1. The user types a party brief into the Gradio chat.
+  2. ``manager`` (a CodeAgent) reads the brief and decides which workers to
+     call: ``song_agent`` for music, ``food_agent`` for a menu,
+     ``trend_agent`` for themed decor/vibe ideas (agentic RAG over the web).
+  3. Each worker is a ToolCallingAgent with its own tool (iTunes search,
+     hardcoded menus, or DuckDuckGo).
+  4. ``ButlerGradioUI`` streams the manager's steps to the chat and shows a
+     live heartbeat while workers churn so the UI never looks stuck.
 """
 from smolagents import (
     CodeAgent,
@@ -22,198 +28,12 @@ import queue
 import time
 
 
-PLACEHOLDER = (
-    "### 🎩 Devoted Butler\n"
-    "Describe your party and I'll coordinate songs and a menu for you.\n\n"
-    "- Give me a theme (for example 'villain masquerade')\n"
-    "- Tell me the venue (for example 'Wayne's mansion')\n"
-    "- Ask for both songs and a menu, or just one\n\n"
-    "_Example:_ Plan a villain masquerade party at Wayne's mansion."
-)
-
-
-class ButlerGradioUI(GradioUI):
-    """GradioUI with a placeholder prompt, soft theme, matching title, and a
-    live heartbeat that keeps the chat moving while workers churn.
-    """
-
-    def _managed_agents(self):
-        return list(getattr(self.agent, "managed_agents", {}).values())
-
-    def _stream_response(self, message, history):  # noqa: ARG002
-        task, task_files = self._process_message(message)
-
-        q: queue.Queue = queue.Queue()
-        workers = self._managed_agents()
-        worker_names = [w.name for w in workers]
-
-        def make_progress_cb(agent_name):
-            def cb(step, agent=None):
-                step_no = getattr(step, "step_number", "?")
-                q.put(("progress", agent_name, f"step {step_no} done"))
-            return cb
-
-        registered = []
-        for sub in workers:
-            cb = make_progress_cb(sub.name)
-            sub.step_callbacks.register(ActionStep, cb)
-            registered.append((sub, cb))
-
-        def run_agent():
-            try:
-                for event in self.agent.run(
-                    task,
-                    images=task_files,
-                    stream=True,
-                    reset=self.reset_agent_memory,
-                    additional_args=None,
-                ):
-                    q.put(("event", event))
-            except Exception as e:
-                q.put(("error", repr(e)))
-            finally:
-                q.put(("done", None))
-
-        threading.Thread(target=run_agent, daemon=True).start()
-
-        all_messages: list = []
-        accumulated_events: list = []
-        streaming_msg_idx = None
-        heartbeat_idx = None
-        worker_status = {name: "idle" for name in worker_names}
-        start = time.time()
-        skip_model_outputs = getattr(self.agent, "stream_outputs", False)
-
-        def heartbeat_msg():
-            elapsed = int(time.time() - start)
-            lines = [f"- {name}: {worker_status[name]}" for name in worker_names]
-            content = "\n".join(lines) + f"\n\n_{elapsed}s elapsed_"
-            return gr.ChatMessage(
-                role="assistant",
-                content=content,
-                metadata={"status": "pending", "title": "Working..."},
-            )
-
-        def ensure_heartbeat():
-            nonlocal heartbeat_idx
-            if heartbeat_idx is None:
-                heartbeat_idx = len(all_messages)
-                all_messages.append(heartbeat_msg())
-            else:
-                all_messages[heartbeat_idx] = heartbeat_msg()
-
-        def drop_heartbeat():
-            nonlocal heartbeat_idx
-            if heartbeat_idx is not None:
-                all_messages.pop(heartbeat_idx)
-                heartbeat_idx = None
-
-        try:
-            while True:
-                try:
-                    item = q.get(timeout=1.0)
-                except queue.Empty:
-                    ensure_heartbeat()
-                    yield all_messages
-                    continue
-
-                kind = item[0]
-
-                if kind == "done":
-                    drop_heartbeat()
-                    yield all_messages
-                    return
-                if kind == "error":
-                    drop_heartbeat()
-                    all_messages.append(
-                        gr.ChatMessage(role="assistant", content=f"Error: {item[1]}")
-                    )
-                    yield all_messages
-                    return
-                if kind == "progress":
-                    _, agent_name, info = item
-                    worker_status[agent_name] = info
-                    ensure_heartbeat()
-                    yield all_messages
-                    continue
-
-                event = item[1]
-                if isinstance(event, (ActionStep, PlanningStep, FinalAnswerStep)):
-                    drop_heartbeat()
-                    if streaming_msg_idx is not None:
-                        all_messages.pop(streaming_msg_idx)
-                        streaming_msg_idx = None
-                    for msg in pull_messages_from_step(
-                        event, skip_model_outputs=skip_model_outputs
-                    ):
-                        all_messages.append(
-                            gr.ChatMessage(
-                                role=msg.role, content=msg.content, metadata=msg.metadata
-                            )
-                        )
-                        yield all_messages
-                    accumulated_events = []
-                elif isinstance(event, ChatMessageStreamDelta):
-                    drop_heartbeat()
-                    accumulated_events.append(event)
-                    text = agglomerate_stream_deltas(accumulated_events).render_as_markdown()
-                    text = text.replace("<", r"\<").replace(">", r"\>")
-                    msg = gr.ChatMessage(role="assistant", content=text)
-                    if streaming_msg_idx is None:
-                        streaming_msg_idx = len(all_messages)
-                        all_messages.append(msg)
-                    else:
-                        all_messages[streaming_msg_idx] = msg
-                    yield all_messages
-        finally:
-            for sub, cb in registered:
-                try:
-                    sub.step_callbacks._callbacks.get(ActionStep, []).remove(cb)
-                except ValueError:
-                    pass
-
-    def create_app(self):
-        type_messages_kwarg = {"type": "messages"} if gr.__version__.startswith("5") else {}
-        chatbot = gr.Chatbot(
-            label="Devoted Butler",
-            placeholder=PLACEHOLDER,
-            avatar_images=(None, "images/butler.png"),
-            latex_delimiters=[
-                {"left": r"$$", "right": r"$$", "display": True},
-                {"left": r"$", "right": r"$", "display": False},
-                {"left": r"\[", "right": r"\]", "display": True},
-                {"left": r"\(", "right": r"\)", "display": False},
-            ],
-            scale=1,
-            **type_messages_kwarg,
-        )
-        css = """
-        .avatar-container img {
-            object-fit: cover !important;
-            width: 100% !important;
-            height: 100% !important;
-            padding: 0 !important;
-        }
-        """
-        examples = [
-            "Suggest party themes",
-            "Songs for a punk rock party",
-            "Menu for a formal dinner with co-workers",
-        ]
-        with gr.Blocks(theme="soft", css=css) as demo:
-            gr.ChatInterface(
-                fn=self._stream_response,
-                chatbot=chatbot,
-                title="Devoted Butler",
-                multimodal=self.file_upload_folder is not None,
-                save_history=True,
-                examples=examples,
-                cache_examples=False,
-                **type_messages_kwarg,
-            )
-        return demo
-
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Model
+# ─────────────────────────────────────────────────────────────────────────────
+# All agents share one local Ollama model. Temperature 0 keeps tool-calling
+# deterministic; the larger context lets the manager hold several worker
+# transcripts at once.
 model = LiteLLMModel(
     model_id="ollama_chat/qwen2.5:14b",
     api_base="http://127.0.0.1:11434",
@@ -222,12 +42,20 @@ model = LiteLLMModel(
 )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Tools
+# ─────────────────────────────────────────────────────────────────────────────
+# Each @tool below is callable by a ToolCallingAgent. The docstring and type
+# hints are what the model sees; keep them tight and example-driven.
+
 @tool
 def suggest_food_menu(occasion: str) -> str:
     """Suggests FOOD and drinks for a party. Returns no music.
     Args:
         occasion: One of 'casual', 'formal', or 'superhero'. Pick the closest match.
     """
+    # Hardcoded menus keyed off a loose occasion string. Returned as a
+    # pseudo-dict so the model sees a clearly structured answer.
     occasion = occasion.lower()
     if "casual" in occasion:
         return "{menu: 'Pizza, snacks, and drinks.'}"
@@ -245,15 +73,72 @@ def find_songs(artists: str) -> str:
     Args:
         artists: Artist names separated by commas. Example: 'Madonna, Iron Maiden, Ozzy Osbourne, Queen, Ice-T'
     """
+    # One iTunes lookup per artist. We filter results to those whose
+    # artistName contains the queried name so we don't surface covers or
+    # unrelated hits, then take the first match.
     lines = []
     for name in (a.strip() for a in artists.split(",")):
-        r = requests.get("https://itunes.apple.com/search", params={"term": name, "entity": "song", "limit": 5}, timeout=10)
+        r = requests.get(
+            "https://itunes.apple.com/search",
+            params={"term": name, "entity": "song", "limit": 5},
+            timeout=10,
+        )
         hits = [t for t in r.json().get("results", []) if name.lower() in t["artistName"].lower()]
-        lines.append(f"{hits[0]['trackName']} - {hits[0]['artistName']}" if hits else f"No song found for {name}")
+        lines.append(
+            f"{hits[0]['trackName']} - {hits[0]['artistName']}" if hits
+            else f"No song found for {name}"
+        )
     return "\n".join(lines)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Prompt fragments
+# ─────────────────────────────────────────────────────────────────────────────
+# The local model occasionally drifted into Thai / other languages mid-run.
+# ENGLISH_RULE goes at the head of each worker's system instructions;
+# ENGLISH_TAIL goes at the foot of each managed-agent task template. Belt
+# and braces: both are needed in practice.
 ENGLISH_RULE = "You MUST write ALL text in English only. No other languages. "
+ENGLISH_TAIL = (
+    "\n\nIMPORTANT: Reply in English ONLY. No other languages anywhere in "
+    "your reasoning or output."
+)
+
+# Managed-agent task templates. smolagents interpolates {{name}} and {{task}}
+# when the manager delegates. Each template pins the exact tool-call shape we
+# want so the manager gets predictable output back.
+SONG_TASK = (
+    "You are '{{name}}'. Your manager gave you this task:\n{{task}}\n\n"
+    "Pick 5 artists whose music fits the task. Then call find_songs ONCE with all five names "
+    "in one string, for example find_songs('Madonna, Iron Maiden, Ozzy Osbourne, Queen, Ice-T'). "
+    "Your last step must be a call to the tool final_answer, with the lines find_songs returned "
+    "as its answer argument. Do not write the songs as plain text. "
+    "Every reply must be a tool call."
+    + ENGLISH_TAIL
+)
+FOOD_TASK = (
+    "You are '{{name}}'. Your manager gave you this task:\n{{task}}\n\n"
+    "Call suggest_food_menu once. Then call final_answer with ONE string containing "
+    "exactly the text the tool returned. Add nothing."
+    + ENGLISH_TAIL
+)
+TREND_TASK = (
+    "You are '{{name}}'. Your manager gave you this task:\n{{task}}\n\n"
+    "Reply 1: ONE tool call to web_search with '<theme> party ideas food music decor'.\n"
+    "Reply 2: ONE tool call to final_answer. The answer argument must be a single Markdown "
+    "STRING (not a dict, not JSON) with exactly these three ### headers:\n"
+    "### Food ideas\n### Music & vibe\n### Setting & decor\n"
+    "Each section has 2-4 '- ' bullets drawn from the search snippets. No URLs. No preamble. "
+    "Every reply is exactly one tool call. Never batch tool calls."
+    + ENGLISH_TAIL
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Worker agents
+# ─────────────────────────────────────────────────────────────────────────────
+# Three specialised ToolCallingAgents. The manager picks among them based on
+# their ``description`` field, so keep those short and purpose-focused.
 
 song_agent = ToolCallingAgent(
     name="song_agent",
@@ -285,6 +170,8 @@ food_agent = ToolCallingAgent(
     ),
 )
 
+# Agentic RAG: searches the live web and synthesises themed ideas. Kept to
+# two tool calls (search, then final_answer) to avoid runaway loops.
 trend_agent = ToolCallingAgent(
     name="trend_agent",
     description=(
@@ -311,40 +198,21 @@ trend_agent = ToolCallingAgent(
     ),
 )
 
-ENGLISH_TAIL = "\n\nIMPORTANT: Reply in English ONLY. No other languages anywhere in your reasoning or output."
-
-SONG_TASK = (
-    "You are '{{name}}'. Your manager gave you this task:\n{{task}}\n\n"
-    "Pick 5 artists whose music fits the task. Then call find_songs ONCE with all five names "
-    "in one string, for example find_songs('Madonna, Iron Maiden, Ozzy Osbourne, Queen, Ice-T'). "
-    "Your last step must be a call to the tool final_answer, with the lines find_songs returned "
-    "as its answer argument. Do not write the songs as plain text. "
-    "Every reply must be a tool call."
-    + ENGLISH_TAIL
-)
-FOOD_TASK = (
-    "You are '{{name}}'. Your manager gave you this task:\n{{task}}\n\n"
-    "Call suggest_food_menu once. Then call final_answer with ONE string containing "
-    "exactly the text the tool returned. Add nothing."
-    + ENGLISH_TAIL
-)
-TREND_TASK = (
-    "You are '{{name}}'. Your manager gave you this task:\n{{task}}\n\n"
-    "Reply 1: ONE tool call to web_search with '<theme> party ideas food music decor'.\n"
-    "Reply 2: ONE tool call to final_answer. The answer argument must be a single Markdown "
-    "STRING (not a dict, not JSON) with exactly these three ### headers:\n"
-    "### Food ideas\n### Music & vibe\n### Setting & decor\n"
-    "Each section has 2-4 '- ' bullets drawn from the search snippets. No URLs. No preamble. "
-    "Every reply is exactly one tool call. Never batch tool calls."
-    + ENGLISH_TAIL
-)
+# Wire the task templates and strip the default report wrapper so the
+# manager receives each worker's final_answer verbatim.
 song_agent.prompt_templates["managed_agent"]["task"] = SONG_TASK
 food_agent.prompt_templates["managed_agent"]["task"] = FOOD_TASK
 trend_agent.prompt_templates["managed_agent"]["task"] = TREND_TASK
-
 for a in (song_agent, food_agent, trend_agent):
     a.prompt_templates["managed_agent"]["report"] = "{{final_answer}}"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Manager agent
+# ─────────────────────────────────────────────────────────────────────────────
+# The manager is a CodeAgent: it writes short Python snippets that call the
+# workers by name. Its instructions pin the delegation policy (which worker
+# for which brief) and the final concatenation format.
 manager = CodeAgent(
     name="devoted_butler",
     description="Devoted Butler. Help plan your party... music, food, you name it.",
@@ -367,6 +235,247 @@ manager = CodeAgent(
         "them. Do not reformat or edit the worker text."
     ),
 )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UI
+# ─────────────────────────────────────────────────────────────────────────────
+PLACEHOLDER = (
+    "### 🎩 Devoted Butler\n"
+    "Describe your party and I'll coordinate songs and a menu for you.\n\n"
+    "- Give me a theme (for example 'villain masquerade')\n"
+    "- Tell me the venue (for example 'Wayne's mansion')\n"
+    "- Ask for both songs and a menu, or just one\n\n"
+    "_Example:_ Plan a villain masquerade party at Wayne's mansion."
+)
+
+
+class ButlerGradioUI(GradioUI):
+    """GradioUI with a placeholder prompt, soft theme, matching title, and a
+    live heartbeat that keeps the chat moving while workers churn.
+
+    The core method is ``_stream_response``. It runs the manager in a
+    background thread and consumes a queue of events, re-rendering the chat
+    on every item. A heartbeat message is injected during quiet stretches
+    so users can see which worker is busy and how long it has been running.
+    """
+
+    def _managed_agents(self):
+        # Convenience accessor: the manager stores workers in a dict.
+        return list(getattr(self.agent, "managed_agents", {}).values())
+
+    def _stream_response(self, message, history):  # noqa: ARG002
+        # Prepare the user task (text + any uploaded files) for the manager.
+        task, task_files = self._process_message(message)
+
+        # The background thread pushes items onto this queue. The main
+        # generator thread (this one) pulls them off and yields chat updates
+        # back to Gradio. Message protocol:
+        #   ("progress", agent_name, info)   worker finished a step
+        #   ("event", event)                 a smolagents event to render
+        #   ("error", repr(exception))       the agent run blew up
+        #   ("done", None)                   the agent run finished cleanly
+        q: queue.Queue = queue.Queue()
+        workers = self._managed_agents()
+        worker_names = [w.name for w in workers]
+
+        def make_progress_cb(agent_name):
+            """Build a step-callback that pushes a progress tick for one worker."""
+            def cb(step, agent=None):
+                step_no = getattr(step, "step_number", "?")
+                q.put(("progress", agent_name, f"step {step_no} done"))
+            return cb
+
+        # Register one progress callback per worker so the heartbeat can
+        # show per-worker status. ``registered`` is kept so we can clean up
+        # in the ``finally`` block below.
+        registered = []
+        for sub in workers:
+            cb = make_progress_cb(sub.name)
+            sub.step_callbacks.register(ActionStep, cb)
+            registered.append((sub, cb))
+
+        def run_agent():
+            """Run the manager and funnel every event onto the queue."""
+            try:
+                for event in self.agent.run(
+                    task,
+                    images=task_files,
+                    stream=True,
+                    reset=self.reset_agent_memory,
+                    additional_args=None,
+                ):
+                    q.put(("event", event))
+            except Exception as e:
+                q.put(("error", repr(e)))
+            finally:
+                q.put(("done", None))
+
+        threading.Thread(target=run_agent, daemon=True).start()
+
+        # ── Rendering state ──
+        # ``all_messages`` is the current chat transcript we re-yield each
+        # tick. ``streaming_msg_idx`` points at an in-progress streamed
+        # message so we can keep overwriting it as deltas arrive.
+        # ``heartbeat_idx`` points at the "Working..." bubble (if present).
+        all_messages: list = []
+        accumulated_events: list = []
+        streaming_msg_idx = None
+        heartbeat_idx = None
+        worker_status = {name: "idle" for name in worker_names}
+        start = time.time()
+        skip_model_outputs = getattr(self.agent, "stream_outputs", False)
+
+        def heartbeat_msg():
+            """Build the current heartbeat bubble from worker_status + elapsed."""
+            elapsed = int(time.time() - start)
+            lines = [f"- {name}: {worker_status[name]}" for name in worker_names]
+            content = "\n".join(lines) + f"\n\n_{elapsed}s elapsed_"
+            return gr.ChatMessage(
+                role="assistant",
+                content=content,
+                metadata={"status": "pending", "title": "Working..."},
+            )
+
+        def ensure_heartbeat():
+            """Append the heartbeat bubble if missing, otherwise refresh it in place."""
+            nonlocal heartbeat_idx
+            if heartbeat_idx is None:
+                heartbeat_idx = len(all_messages)
+                all_messages.append(heartbeat_msg())
+            else:
+                all_messages[heartbeat_idx] = heartbeat_msg()
+
+        def drop_heartbeat():
+            """Remove the heartbeat bubble, if any. Called when real content arrives."""
+            nonlocal heartbeat_idx
+            if heartbeat_idx is not None:
+                all_messages.pop(heartbeat_idx)
+                heartbeat_idx = None
+
+        try:
+            # Main consumer loop. We poll the queue with a 1s timeout so we
+            # can refresh the heartbeat during silent stretches.
+            while True:
+                try:
+                    item = q.get(timeout=1.0)
+                except queue.Empty:
+                    # No event this tick: show / refresh the heartbeat.
+                    ensure_heartbeat()
+                    yield all_messages
+                    continue
+
+                kind = item[0]
+
+                # ── Terminal cases ──
+                if kind == "done":
+                    drop_heartbeat()
+                    yield all_messages
+                    return
+                if kind == "error":
+                    drop_heartbeat()
+                    all_messages.append(
+                        gr.ChatMessage(role="assistant", content=f"Error: {item[1]}")
+                    )
+                    yield all_messages
+                    return
+
+                # ── Progress tick: just update the heartbeat ──
+                if kind == "progress":
+                    _, agent_name, info = item
+                    worker_status[agent_name] = info
+                    ensure_heartbeat()
+                    yield all_messages
+                    continue
+
+                # ── Agent event: either a completed step or a streaming delta ──
+                event = item[1]
+                if isinstance(event, (ActionStep, PlanningStep, FinalAnswerStep)):
+                    # A step finished. Discard any in-progress stream bubble
+                    # (its content is superseded) and render the finalised
+                    # step messages from smolagents.
+                    drop_heartbeat()
+                    if streaming_msg_idx is not None:
+                        all_messages.pop(streaming_msg_idx)
+                        streaming_msg_idx = None
+                    for msg in pull_messages_from_step(
+                        event, skip_model_outputs=skip_model_outputs
+                    ):
+                        all_messages.append(
+                            gr.ChatMessage(
+                                role=msg.role, content=msg.content, metadata=msg.metadata
+                            )
+                        )
+                        yield all_messages
+                    accumulated_events = []
+                elif isinstance(event, ChatMessageStreamDelta):
+                    # Mid-step token delta. Accumulate, render, and keep
+                    # overwriting the same bubble until the step ends.
+                    drop_heartbeat()
+                    accumulated_events.append(event)
+                    text = agglomerate_stream_deltas(accumulated_events).render_as_markdown()
+                    # Escape raw < > so Gradio's markdown renderer doesn't
+                    # eat them as HTML tags.
+                    text = text.replace("<", r"\<").replace(">", r"\>")
+                    msg = gr.ChatMessage(role="assistant", content=text)
+                    if streaming_msg_idx is None:
+                        streaming_msg_idx = len(all_messages)
+                        all_messages.append(msg)
+                    else:
+                        all_messages[streaming_msg_idx] = msg
+                    yield all_messages
+        finally:
+            # Always unregister our progress callbacks so repeat runs don't
+            # stack duplicates on the same agent.
+            for sub, cb in registered:
+                try:
+                    sub.step_callbacks._callbacks.get(ActionStep, []).remove(cb)
+                except ValueError:
+                    pass
+
+    def create_app(self):
+        # Gradio 5 switched Chatbot to the OpenAI-style messages format; feed
+        # the kwarg conditionally so we still work on Gradio 4.
+        type_messages_kwarg = {"type": "messages"} if gr.__version__.startswith("5") else {}
+        chatbot = gr.Chatbot(
+            label="Devoted Butler",
+            placeholder=PLACEHOLDER,
+            avatar_images=(None, "images/butler.png"),
+            latex_delimiters=[
+                {"left": r"$$", "right": r"$$", "display": True},
+                {"left": r"$", "right": r"$", "display": False},
+                {"left": r"\[", "right": r"\]", "display": True},
+                {"left": r"\(", "right": r"\)", "display": False},
+            ],
+            scale=1,
+            **type_messages_kwarg,
+        )
+        # Make the butler avatar fill its circular frame instead of letterboxing.
+        css = """
+        .avatar-container img {
+            object-fit: cover !important;
+            width: 100% !important;
+            height: 100% !important;
+            padding: 0 !important;
+        }
+        """
+        examples = [
+            "Suggest party themes",
+            "Songs for a punk rock party",
+            "Menu for a formal dinner with co-workers",
+        ]
+        with gr.Blocks(theme="soft", css=css) as demo:
+            gr.ChatInterface(
+                fn=self._stream_response,
+                chatbot=chatbot,
+                title="Devoted Butler",
+                multimodal=self.file_upload_folder is not None,
+                save_history=True,
+                examples=examples,
+                cache_examples=False,
+                **type_messages_kwarg,
+            )
+        return demo
 
 
 if __name__ == "__main__":
